@@ -149,8 +149,29 @@ public class JedisLocker {
 			lockObject.key = key;
 			lockObject.val = val;
 			lockObject.expireMilliseconds = expireMilliseconds;
+			lockObject.jedisResource = jedisResource;
+			lockObject.unlocked = false;
 		}
 		return lockObject;
+	}
+
+	/**
+	 * <pre>
+	 * 使用获得锁相同的Jedis资源来释放锁
+	 * </pre>
+	 * @param lockObject
+	 * @return
+	 */
+	public static int unlock(LockObject lockObject) {
+		Jedis jedis = null;
+		try {
+			jedis = lockObject.getJedisResource().getResource();
+			return unlock(jedis, lockObject);
+		} finally {
+			if (jedis != null) {
+				lockObject.getJedisResource().releaseResource(jedis);
+			}
+		}
 	}
 
 	/**
@@ -174,40 +195,58 @@ public class JedisLocker {
 	}
 
 	public static int unlock(Jedis jedis, LockObject lockObject) {
+		if (lockObject.isUnlocked()) {
+			return lockObject.unlockRt;
+		}
+		int unlockRt = -1;
 		Long pttl = jedis.pttl(lockObject.getKey());
 		if (pttl == -2) {
-			return 1;
+			unlockRt = 1;
 
 		} else {
-			jedis.watch(lockObject.getKey());
-			try {
-				String val = jedis.get(lockObject.getKey());
-				if (val == null) {
-					return 1;
+			while (true) {
+				jedis.watch(lockObject.getKey());
+				try {
+					String val = jedis.get(lockObject.getKey());
+					if (val == null) {
+						unlockRt = 1;
+						break;
+					}
+					if (!val.equals(lockObject.getVal())) {
+						unlockRt = 2;
+						break;
+					}
+					Transaction trans = jedis.multi();
+					trans.del(lockObject.getKey());
+					Long rt = (Long) trans.exec().get(0);
+					if (rt == null) {
+						unlockRt = 2;
+						break;
+					} else if (rt == 0) {
+						unlockRt = 1;
+						break;
+					} else {
+						unlockRt = 0;
+						break;
+					}
+				} finally {
+					jedis.unwatch();
 				}
-				if (!val.equals(lockObject.getVal())) {
-					return 2;
-				}
-				Transaction trans = jedis.multi();
-				trans.del(lockObject.getKey());
-				Long rt = (Long) trans.exec().get(0);
-				if (rt == null) {
-					return 2;
-				} else if (rt == 0) {
-					return 1;
-				} else {
-					return 0;
-				}
-			} finally {
-				jedis.unwatch();
 			}
 		}
+		lockObject.unlocked = true;
+		lockObject.unlockRt = unlockRt;
+		return unlockRt;
 	}
 
-	public static class LockObject {
+	public static class LockObject implements AutoCloseable {
 		protected String key;
 		protected String val;
 		protected Long expireMilliseconds;
+
+		protected JedisResource jedisResource;
+		protected boolean unlocked;
+		protected int unlockRt = -1;
 
 		public String getKey() {
 			return key;
@@ -220,6 +259,42 @@ public class JedisLocker {
 		public Long getExpireMilliseconds() {
 			return expireMilliseconds;
 		}
+
+		public JedisResource getJedisResource() {
+			return jedisResource;
+		}
+
+		public boolean isUnlocked() {
+			return unlocked;
+		}
+
+		public int getUnlockRt() {
+			return unlockRt;
+		}
+
+		public int unlock() {
+			return JedisLocker.unlock(this);
+		}
+
+		public int unlock(JedisPool jedisPool) {
+			return JedisLocker.unlock(jedisPool, this);
+		}
+
+		public int unlock(Jedis jedis) {
+			return JedisLocker.unlock(jedis, this);
+		}
+
+		@Override
+		public void close() {
+			unlock();
+		}
+
+		@Override
+		public String toString() {
+			return "LockObject [key=" + key + ", val=" + val + ", expireMilliseconds=" + expireMilliseconds + ", unlocked="
+					+ unlocked + ", unlockRt=" + unlockRt + "]";
+		}
+
 	}
 
 	protected static class JedisResource {
